@@ -4,7 +4,7 @@ import React, { useRef, useState, useCallback, useEffect, useLayoutEffect, useIm
 import { createPortal } from "react-dom";
 import { ChevronDown, ClipboardPaste, ListChecks, Loader2, Mic, Paperclip, Plus, RotateCw, Shrink, Snail, Sparkles, Wrench, X, Zap } from "lucide-react";
 import { getSubmitDuringRunBehavior, isWordCompletionEnabled } from "@/lib/composer-prefs";
-import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
+import type { BuiltinSlashCommandResult, CompactResultInfo, PromptSubmissionResult, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { ActiveGoal, ActivePlan } from "@/lib/web-mode-state";
 import { toast } from "@/components/ui/toast";
 import { ConfirmDialog } from "@/components/ui/field";
@@ -150,7 +150,8 @@ const TOOL_PRESET_OPTIONS: Array<{ value: ToolPreset; descriptionKey: string }> 
 ];
 
 interface Props {
-  onSend: (message: string, images?: AttachedImage[]) => void;
+  /** Only a rejected submission is restored; completed/superseded runs must not be replayed. */
+  onSend: (message: string, images?: AttachedImage[]) => Promise<PromptSubmissionResult>;
   /** Ghost-text word completion for the draft (omp `predict_word`); absent = no ghost text. */
   onPredictWord?: PredictWord;
   onPredictWordFeedback?: PredictWordFeedback;
@@ -160,6 +161,8 @@ interface Props {
   onFollowUp?: (message: string, images?: AttachedImage[]) => Promise<boolean>;
   onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => Promise<boolean>;
   isStreaming: boolean;
+  /** Refuse submission without treating a pending history edit as a model run. */
+  submissionBlocked?: boolean;
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
   modelNames?: Record<string, string>;
@@ -332,6 +335,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onBuiltinCommand,
   onAudioUnlock,
   onPromptWithStreamingBehavior,
+  submissionBlocked = false,
   advisorActive,
   advisorModel,
   onCompact,
@@ -457,6 +461,8 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
   const fileIndexFetchingRef = useRef<string | null>(null);
   const draftKeyRef = useRef(draftKey);
+  // Async dictation and slash-command completions must see the latest edit gate.
+  const submissionBlockedRef = useRef(submissionBlocked);
   const valueRef = useRef(value);
   const attachedImagesRef = useRef(attachedImages);
   const attachedTextFilesRef = useRef(attachedTextFiles);
@@ -466,6 +472,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const pendingImageCountRef = useRef(0);
   const pendingTextFileCountRef = useRef(0);
   const pendingTextFileBytesRef = useRef(0);
+  submissionBlockedRef.current = submissionBlocked;
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
   attachedTextFilesRef.current = attachedTextFiles;
@@ -861,11 +868,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
    * success and only if it still holds what was sent (the user may have
    * started typing while the command ran). */
   const runBuiltinCommand = useCallback(async (msg: string, overrideText?: string): Promise<boolean> => {
-    if (!onBuiltinCommand) return false;
+    if (submissionBlockedRef.current || !onBuiltinCommand) return false;
     const sentValue = overrideText ?? valueRef.current;
     const result = await onBuiltinCommand(msg);
     if (!result.handled) return false;
-    if (!result.error && !result.retainInput && (overrideText !== undefined || valueRef.current === sentValue)) clearInput();
+    if (!submissionBlockedRef.current && !result.error && !result.retainInput && (overrideText !== undefined || valueRef.current === sentValue)) clearInput();
     return true;
   }, [onBuiltinCommand, clearInput]);
 
@@ -886,7 +893,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const raw = overrideText ?? value;
     const msg = raw.trim();
     if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length) return;
-    if (isStreaming) return;
+    if (submissionBlockedRef.current || isStreaming) return;
     onAudioUnlock?.();
     if (sendSideQuestion(msg, overrideText)) return;
     const composedMessage = composeMessageWithTextAttachments(msg, attachedTextFilesRef.current);
@@ -895,9 +902,23 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       if (expansion.kind === "expand" && rejectsOversizedPrompt(expansion.prompt, attachedImagesRef.current)) return;
       if (await runBuiltinCommand(msg, overrideText)) return;
     }
+    if (submissionBlockedRef.current) return;
     if (rejectsOversizedPrompt(composedMessage, attachedImagesRef.current)) return;
-    onSend(composedMessage, attachedImagesRef.current.length ? attachedImagesRef.current : undefined);
+    const key = draftKeyRef.current;
+    const images = attachedImagesRef.current.length ? attachedImagesRef.current : undefined;
+    const recovery = { text: composedMessage, images: images?.map(imageToDraftImage) };
+    const pending = onSend(composedMessage, images);
     clearInput();
+    try {
+      const result = await pending;
+      if (result.status === "rejected") {
+        const destination = result.recoveryKey ?? key;
+        if (destination) recoverDraft(destination, recovery);
+      }
+    } catch (error) {
+      if (key) recoverDraft(key, recovery);
+      throw error;
+    }
   }, [value, isStreaming, onBuiltinCommand, onSend, clearInput, onAudioUnlock, rejectsOversizedPrompt, runBuiltinCommand, sendSideQuestion]);
   const {
     isRecording,
@@ -929,6 +950,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       const sep = base.length > 0 && !base.endsWith(" ") ? " " : "";
       const finalText = base + sep + text;
       insertTextAtCursor(text);
+      // A send/queue chosen before Edit started now remains an unsent draft.
+      if (submissionBlockedRef.current) {
+        toast.success(t("chatInput.dictationSuccess"));
+        return;
+      }
       if (after && onFollowUp) {
         sendQueued(after === "send" ? "followup" : after, finalText);
       } else if (after && !isStreaming) {
@@ -956,6 +982,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   // From the review deck the recorder has already stopped, so finishing with a
   // send/queue choice transcribes the reviewed recording instead.
   const stopAndFinishDictation = useCallback((after: SttAfter) => {
+    if (submissionBlockedRef.current) return;
     if (isReviewing) confirmTranscribeDictation({ after });
     else stopDictation({ after });
   }, [isReviewing, confirmTranscribeDictation, stopDictation]);
@@ -1328,6 +1355,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   }, [slashMatch, value]);
 
   const sendQueued = useCallback((mode: "steer" | "followup", overrideText?: string) => {
+    if (submissionBlockedRef.current) return;
     const raw = overrideText ?? value;
     const msg = raw.trim();
     if (!msg && !attachedImagesRef.current.length && !attachedTextFilesRef.current.length) return;
@@ -1418,7 +1446,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     entry: { kind: "follow-up" | "steer"; text: string },
     action: "edit" | "delete" | "steer",
   ) => {
-    if (queueActionPendingRef.current) return;
+    if (queueActionPendingRef.current || (action === "steer" && submissionBlockedRef.current)) return;
     queueActionPendingRef.current = true;
     setQueueActionPending(true);
     const key = draftKeyRef.current;
@@ -1657,6 +1685,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       // inserts a newline and the Send button submits.
       if (e.key === "Enter" && !e.shiftKey && !isMobile) {
         e.preventDefault();
+        if (submissionBlockedRef.current) return;
         if (isStreaming && (onSteer || onFollowUp)) {
           // Submit-during-run behavior comes from Settings (Queue follow-up by
           // default, or Steer current run); no in-composer selector.
@@ -2528,7 +2557,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   {t("chatInput.queuedDelete")}
                 </QueuedActionButton>
                 {firstQueued?.kind === "follow-up" && (
-                  <QueuedActionButton disabled={queueActionPending || !onPromoteQueuedToSteer} onClick={handleQueuedSteer} title={t("chatInput.queuedSteerTitle")} accent>
+                  <QueuedActionButton disabled={submissionBlocked || queueActionPending || !onPromoteQueuedToSteer} onClick={handleQueuedSteer} title={t("chatInput.queuedSteerTitle")} accent>
                     {t("chatInput.queuedSteerAction")}
                   </QueuedActionButton>
                 )}
@@ -2670,7 +2699,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                           {t("chatInput.queuedDelete")}
                         </QueuedActionButton>
                         {entry.kind === "follow-up" && (
-                          <QueuedActionButton disabled={queueActionPending || !onPromoteQueuedToSteer} onClick={() => void handleQueueAction(entry, "steer")} title={t("chatInput.queuedSteerTitle")} accent>
+                          <QueuedActionButton disabled={submissionBlocked || queueActionPending || !onPromoteQueuedToSteer} onClick={() => void handleQueueAction(entry, "steer")} title={t("chatInput.queuedSteerTitle")} accent>
                             {t("chatInput.queuedSteerAction")}
                           </QueuedActionButton>
                         )}
@@ -3449,7 +3478,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                     sendQueued("followup");
                   }
                 }}
-                disabled={isTranscribing}
+                disabled={submissionBlocked || isTranscribing}
                 title={t("chatInput.queueMessage")}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
@@ -3494,7 +3523,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                 type="button"
                 className="composer-primary-action"
                 onClick={isRecording || isPaused || isReviewing ? () => stopAndFinishDictation("send") : () => void handleSend()}
-                disabled={isTranscribing || !(isRecording || isPaused || isReviewing || value.trim() || attachedImages.length || attachedTextFiles.length)}
+                disabled={submissionBlocked || isTranscribing || !(isRecording || isPaused || isReviewing || value.trim() || attachedImages.length || attachedTextFiles.length)}
                 title={isRecording || isPaused || isReviewing ? t("chatInput.sendDictation") : t("chatInput.send")}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
@@ -3502,7 +3531,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
                   border: "none",
                   borderRadius: 8,
                   color: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "var(--on-accent)" : "var(--text-dim)",
-                  cursor: isTranscribing ? "wait" : (isRecording || isPaused || isReviewing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "pointer" : "not-allowed",
+                  cursor: submissionBlocked ? "not-allowed" : isTranscribing ? "wait" : (isRecording || isPaused || isReviewing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "pointer" : "not-allowed",
                   fontSize: 12,
                   fontWeight: 600,
                   boxShadow: (isRecording || isPaused || isReviewing || isTranscribing || value.trim() || attachedImages.length || attachedTextFiles.length) ? "var(--shadow-card)" : "none",
