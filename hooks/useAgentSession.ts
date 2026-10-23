@@ -17,7 +17,7 @@ import { hasVisibleAssistantContent } from "@/lib/assistant-response";
 import type { ThinkingModelMeta } from "@/lib/thinking-levels";
 import { sendAgentCommand, setSessionAdvisorSpawn } from "@/lib/agent-client";
 import { parseSkillDiagnosticsSnapshot, type SkillDiagnosticsSnapshot } from "@/lib/skill-diagnostics";
-import { recoverDraft, setDraft, toDraftImages, type ChatDraftImage } from "@/lib/draft-store";
+import { clearDraft, getDraft, mergeRecoveredText, recoverDraft, setDraft, toDraftImages, type ChatDraft, type ChatDraftImage } from "@/lib/draft-store";
 import { formatExitedSessionNotice, translate } from "@/lib/i18n";
 import { usePrefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
 import { toastBtwError, useBtw } from "@/hooks/useBtw";
@@ -181,6 +181,8 @@ export interface UseAgentSessionOptions {
   onAgentEnd?: () => void;
   onSessionCreated?: (session: SessionInfo) => void;
   onSessionForked?: (newSessionId: string) => void;
+  /** The server confirmed this conversation moved files, not a fork or navigation. */
+  onSessionMoved?: (oldId: string, newId: string, sourceDraft?: ChatDraft) => void;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   modelsRefreshKey?: number;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
@@ -197,7 +199,7 @@ export interface UseAgentSessionOptions {
 
 export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
-    session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked,
+    session, newSessionCwd, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved,
     modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
     onOpenFile, onOpenUrl,
   } = opts;
@@ -380,6 +382,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const activeSubagentCount = subagents.filter((subagent) => subagent.source !== "history" && subagent.status === "started").length;
 
   const eventSourceRef = useRef<EventStream | null>(null);
+  // Closing the transport does not emit onerror. Its pending readiness wait
+  // must therefore be settled by the same owner that replaces/unmounts it.
+  const cancelEventConnectionRef = useRef<(() => void) | null>(null);
   const reconnectTimerRef = useRef<NodeJS.Timeout | undefined>(undefined);
   const eventStreamRetryMsRef = useRef<number>(EVENT_STREAM_RETRY_MIN_MS);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
@@ -977,8 +982,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     eventCoalescer.reset();
     dispatch({ type: "reset" });
     clearLiveToolResults();
-    // Keep the composer mounted while reloading both the active context and
-    // tree. A successful edit never switches sessions or seeds a new draft.
+    // Keep the composer mounted while reloading the confirmed conversation's
+    // active context and tree, including a native ownership relocation.
     return loadSession(sid, false, true);
   }, [catchUp, clearLiveToolResults, eventCoalescer, loadSession]);
 
@@ -1134,12 +1139,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [applyQueueStateSnapshot, applySkillDiagnosticsSnapshot]);
 
-  const connectEvents = useCallback((sid: string, restoreWrapper = false): Promise<EventStreamConnectionResult> => {
+  const connectEvents = useCallback((sid: string, restoreWrapper = false): Promise<EventStreamConnectionResult | null> => {
+    // An awaited RPC can finish after its chat unmounted. No continuation may
+    // acquire an observer once this instance's lifetime cleanup has run.
+    if (!hookAliveRef.current || sessionIdRef.current !== sid) return Promise.resolve(null);
     // A backoff timer from an earlier CLOSED stream may still be pending (e.g.
     // the user sent a message while it waited). It must not fire later and
     // tear down the healthy stream built here — drop it before replacing.
     clearTimeout(reconnectTimerRef.current);
     reconnectTimerRef.current = undefined;
+    cancelEventConnectionRef.current?.();
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
@@ -1164,14 +1173,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
+        if (cancelEventConnectionRef.current === cancel) cancelEventConnectionRef.current = null;
         resolve({ status, source: es });
       };
+      const cancel = () => settle("closed");
+      cancelEventConnectionRef.current = cancel;
       const timeout = setTimeout(() => settle("timeout"), EVENT_STREAM_CONNECT_TIMEOUT_MS);
       // The stream is live as soon as the response headers land, whether or not
       // the server also sends an explicit `connected` frame. A successful open
       // resets retry backoff and catches up the persisted transcript.
       es.onopen = () => {
-        if (eventSourceRef.current !== es || sessionIdRef.current !== sid) return;
+        if (!hookAliveRef.current || eventSourceRef.current !== es || sessionIdRef.current !== sid) return;
         eventStreamRetryMsRef.current = EVENT_STREAM_RETRY_MIN_MS;
         settle("connected");
         restore();
@@ -1185,7 +1197,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       };
 
       es.onmessage = (e) => {
-        if (eventSourceRef.current !== es || sessionIdRef.current !== sid) return;
+        if (!hookAliveRef.current || eventSourceRef.current !== es || sessionIdRef.current !== sid) return;
         try {
           const event = JSON.parse(e.data) as AgentEvent;
           // Side-question frames never touch the transcript and useBtw batches
@@ -1233,7 +1245,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           // page reload; the backoff bounds the retry loop against endpoints
           // that keep failing (e.g. a 409 "not managed" wrapper-less session).
           settle("closed");
-          if (eventSourceRef.current === es) {
+          if (hookAliveRef.current && sessionIdRef.current === sid && eventSourceRef.current === es) {
             eventSourceRef.current = null;
             const delay = eventStreamRetryMsRef.current;
             eventStreamRetryMsRef.current = Math.min(delay * 2, EVENT_STREAM_RETRY_MAX_MS);
@@ -1475,21 +1487,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // Declared after addNotice: the dependency array below is evaluated during
   // render, so addNotice must already be initialized.
   const ensureEventsConnected = useCallback(async (sid: string) => {
+    if (!hookAliveRef.current || sessionIdRef.current !== sid) throw new EventStreamConnectionError("closed");
     // Only this (send-blocking) path announces a slow connect; the mount and
     // auto-reconnect paths call connectEvents directly and stay silent.
     const slowNotice = setTimeout(() => {
       addNotice({ type: "info", message: translate("agentSession.startingAgent") });
     }, EVENT_STREAM_SLOW_CONNECT_MS);
-    let result: EventStreamConnectionResult;
+    let result: EventStreamConnectionResult | null;
     try {
       result = await connectEvents(sid);
     } finally {
       clearTimeout(slowNotice);
     }
-    if (result.status === "connected" || result.source.readyState === EVENT_STREAM_OPEN) return;
+    if (!result) throw new EventStreamConnectionError("closed");
+    const current = hookAliveRef.current && sessionIdRef.current === sid && eventSourceRef.current === result.source;
+    if (current && (result.status === "connected" || result.source.readyState === EVENT_STREAM_OPEN)) return;
     if (eventSourceRef.current === result.source) eventSourceRef.current = null;
     result.source.close();
-    throw new EventStreamConnectionError(result.status);
+    throw new EventStreamConnectionError(current && result.status === "timeout" ? "timeout" : "closed");
   }, [addNotice, connectEvents]);
 
   const handleExtensionUiRequest = useCallback((request: IncomingExtensionUiRequest) => {
@@ -2735,7 +2750,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // not a request to stop following the response that this prompt starts.
     userScrollIntentUntilRef.current = 0;
 
-    let recoveryKey = session?.id ?? (newSessionCwd ? `new:${newSessionCwd}` : undefined);
+    let recoveryKey = sessionIdRef.current ?? (newSessionCwd ? `new:${newSessionCwd}` : undefined);
     try {
       let sentSessionId: string | null = null;
       // The agent route degrades a prompt into omp's follow-up queue when a
@@ -2785,19 +2800,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           }));
         }
       } else if (session) {
-        sentSessionId = session.id;
+        const sid = sessionIdRef.current ?? session.id;
+        sentSessionId = sid;
         // The event route is observer-only. Start or resume the web-owned RPC
         // wrapper with a supported command before opening the SSE connection.
-        await sendAgentCommand(session.id, { type: "get_state" });
-        await ensureEventsConnected(session.id);
-        void refreshSubagentRoster(session.id);
-        void registerHostTools(session.id);
-        void registerHostUriSchemes(session.id);
-        const previousEntryIds = await snapshotRunEntries(session.id);
-        if (promptRunIdRef.current === promptRunId && sessionIdRef.current === session.id) {
+        await sendAgentCommand(sid, { type: "get_state" });
+        await ensureEventsConnected(sid);
+        void refreshSubagentRoster(sid);
+        void registerHostTools(sid);
+        void registerHostUriSchemes(sid);
+        const previousEntryIds = await snapshotRunEntries(sid);
+        if (promptRunIdRef.current === promptRunId && sessionIdRef.current === sid) {
           runPreviousEntryIdsRef.current = previousEntryIds;
         }
-        queuedBehindShell = isQueuedWhileShellRunning(await sendAgentCommand(session.id, {
+        queuedBehindShell = isQueuedWhileShellRunning(await sendAgentCommand(sid, {
           type: "prompt",
           message,
           ...(piImages?.length ? { images: piImages } : {}),
@@ -3111,19 +3127,29 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setEditingEntryId(entryId);
     contextRequestSeqRef.current += 1;
     catchUp.invalidate();
-    const isCurrent = () => hookAliveRef.current && sessionIdRef.current === sid && editInFlightRef.current === edit;
+    const isCurrent = () => hookAliveRef.current && sessionIdRef.current === edit.sessionId && editInFlightRef.current === edit;
     try {
       const result = await sendAgentCommand<{ cancelled: boolean; leafId: string | null; sessionId: string }>(sid, {
         type: "edit_message",
         entryId,
       });
       if (!isCurrent()) return false;
-      if (!result || result.sessionId !== sid) throw new Error(translate("agentSession.commandFailed"));
+      if (!result || typeof result.sessionId !== "string" || !result.sessionId
+        || typeof result.cancelled !== "boolean" || (result.leafId !== null && typeof result.leafId !== "string")) {
+        throw new Error(translate("agentSession.commandFailed"));
+      }
       if (result.cancelled) return false;
+      // The backend accepts a changed id only through its native ownership-move
+      // registry; a genuine session switch fails there. Never infer movement
+      // from a history echo or a change of the user's selected session.
+      const moved = result.sessionId !== sid;
+      edit.sessionId = result.sessionId;
+      sessionIdRef.current = result.sessionId;
       if (typeof result.leafId === "string") {
         let handled = handledEditHistoryRef.current;
-        if (!handled || handled.sessionId !== sid) {
-          handled = { sessionId: sid, leafIds: new Set<string>() };
+        if (moved && handled?.sessionId === sid) handled.sessionId = edit.sessionId;
+        if (!handled || handled.sessionId !== edit.sessionId) {
+          handled = { sessionId: edit.sessionId, leafIds: new Set<string>() };
           handledEditHistoryRef.current = handled;
         }
         // Record before reloading: an echo during or after that reload must
@@ -3135,10 +3161,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         if (edit.pendingHistoryChange?.leafId === result.leafId) edit.pendingHistoryChange = null;
       }
-      const loaded = await reloadActiveSessionHistory(sid);
+      if (moved) void connectEvents(edit.sessionId);
+      const loaded = await reloadActiveSessionHistory(edit.sessionId);
       if (!isCurrent()) return false;
+      if (moved) {
+        // Snapshot after the reload: typing and attachments added while it
+        // awaited still belong to this edit's composer. Its identity changes
+        // without remounting; only a confirmed history load may seed edit text.
+        const draft = getDraft(sid) ?? { value: "", images: [], files: [] };
+        const destination = getDraft(edit.sessionId);
+        const value = destination ? mergeRecoveredText(destination.value, { text: draft.value }) : draft.value;
+        // Free the source slot before inserting an absent target: moving a
+        // draft at capacity must not evict an unrelated conversation's draft.
+        clearDraft(sid);
+        setDraft(edit.sessionId, {
+          value: loaded && !value.trim() ? content : value,
+          images: destination ? [...draft.images, ...destination.images] : draft.images,
+          files: destination ? [...draft.files, ...destination.files] : draft.files,
+        });
+        onSessionMoved?.(sid, edit.sessionId, draft);
+      }
       if (!loaded) throw new Error(translate("agentSession.commandFailed"));
-      opts.chatInputRef?.current?.insertIfEmpty(content);
+      // A moved composer adopts the merged target snapshot during its identity
+      // transition; writing through the old ref could overwrite target text.
+      if (!moved) opts.chatInputRef?.current?.insertIfEmpty(content);
       return true;
     } catch (error) {
       if (isCurrent()) {
@@ -3150,7 +3196,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         editInFlightRef.current = null;
         if (hookAliveRef.current) {
           setEditingEntryId(null);
-          if (sessionIdRef.current === sid) {
+          if (sessionIdRef.current === edit.sessionId) {
             // A cancelled/failed edit has no own marker; a distinct event must
             // still refresh the active history once this owner releases it.
             if (edit.pendingHistoryChange) handleAgentEventRef.current?.(edit.pendingHistoryChange);
@@ -3159,7 +3205,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
       }
     }
-  }, [addNotice, catchUp, isNew, opts.chatInputRef, reloadActiveSessionHistory]);
+  }, [addNotice, catchUp, connectEvents, isNew, onSessionMoved, opts.chatInputRef, reloadActiveSessionHistory]);
 
   // editPrompt: omp's `branch` drops the chosen user prompt from the fork and
   // returns its text — put it in the fork's composer (edit-and-resend).
@@ -3871,26 +3917,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         void catchUp.request();
       });
     }
-    return () => {
-      clearTerminalReconcileTimer();
-      bashRecoveryIdRef.current += 1;
-      eventCoalescerRef.current?.reset();
-      catchUp.disconnect();
-      eventSourceRef.current?.close();
-      eventSourceRef.current = null;
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = undefined;
-      if (rosterRefreshTimerRef.current) {
-        clearTimeout(rosterRefreshTimerRef.current);
-        rosterRefreshTimerRef.current = null;
-      }
-      if (subagentVersionFlushFrameRef.current !== null) {
-        cancelAnimationFrame(subagentVersionFlushFrameRef.current);
-        subagentVersionFlushFrameRef.current = null;
-      }
-      subagentVersionFlushRef.current = null;
-      subagentActivityFlushRef.current = null;
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSubagentRoster, registerHostTools, registerHostUriSchemes]);
 
@@ -3985,12 +4011,33 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [messages, streamState, agentRunning, agentPhase, extensionWidgets, isCompacting, retryInfo, activeSubagentCount, todoPhases, scrollToBottom, loading]);
 
   useEffect(() => {
+    // This lifetime cleanup must survive the mount-load latch's early return
+    // on StrictMode replay. The observer may attach after that first cleanup.
     hookAliveRef.current = true;
     return () => {
       hookAliveRef.current = false;
+      clearTerminalReconcileTimer();
+      bashRecoveryIdRef.current += 1;
+      eventCoalescerRef.current?.reset();
+      catchUp.disconnect();
+      cancelEventConnectionRef.current?.();
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = undefined;
+      if (rosterRefreshTimerRef.current) {
+        clearTimeout(rosterRefreshTimerRef.current);
+        rosterRefreshTimerRef.current = null;
+      }
+      if (subagentVersionFlushFrameRef.current !== null) {
+        cancelAnimationFrame(subagentVersionFlushFrameRef.current);
+        subagentVersionFlushFrameRef.current = null;
+      }
+      subagentVersionFlushRef.current = null;
+      subagentActivityFlushRef.current = null;
       if (followScrollFrameRef.current !== null) cancelAnimationFrame(followScrollFrameRef.current);
     };
-  }, []);
+  }, [catchUp, clearTerminalReconcileTimer]);
 
   // Load model list
   useEffect(() => {

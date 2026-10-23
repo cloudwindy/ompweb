@@ -15,7 +15,7 @@ import type { SttAfter } from "@/lib/stt";
 import { formatCompactNumber, formatPercent } from "@/lib/format";
 import { ContextDetailPanel } from "./ComposerPanels";
 import { RecordingDeck } from "./RecordingDeck";
-import { clearDraft, getDraft, mergeRecoveredText, recoverDraft, setDraft, subscribeDraftRecovery, type ChatDraftImage } from "@/lib/draft-store";
+import { clearDraft, getDraft, mergeRecoveredText, recoverDraft, setDraft, subscribeDraftRecovery, type ChatDraft, type ChatDraftImage } from "@/lib/draft-store";
 import { expandWebSlashCommand } from "@/lib/web-slash-commands";
 import type { AttachedImage, AttachedTextFile } from "./ChatInput-draft-attachments";
 import {
@@ -225,6 +225,8 @@ interface Props {
   onBuiltinCommand?: (message: string) => Promise<BuiltinSlashCommandResult>;
   onAudioUnlock?: () => void;
   draftKey?: string;
+  /** Backend-confirmed ownership relocation, distinct from navigating to a draft. */
+  draftIdentityMove?: { from: string; to: string; sourceDraft?: ChatDraft };
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
   activeGoal?: ActiveGoal | null;
@@ -247,6 +249,8 @@ export interface ChatInputHandle {
   prependText: (text: string) => void;
   addFiles: (files: File[]) => void;
   openContextPanel: () => void;
+  /** Retarget captured queue recoveries before a confirmed move can render. */
+  retargetPendingRecovery: (from: string, to: string) => void;
 }
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
 
@@ -347,6 +351,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   onRemoveQueuedMessage,
   onPromoteQueuedToSteer,
   draftKey = "new:unassigned",
+  draftIdentityMove,
   cwd,
   activeGoal,
   activePlan,
@@ -461,6 +466,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
   const fileIndexFetchingRef = useRef<string | null>(null);
   const draftKeyRef = useRef(draftKey);
+  const consumedIdentityMoveRef = useRef<typeof draftIdentityMove>(undefined);
+  // Pending queue edits retain this identity across confirmed moves only.
+  // Navigation starts a new identity, even when a draft key is later reused.
+  const draftRecoveryIdentityRef = useRef({ key: draftKey });
+  const persistedDraftRef = useRef<ChatDraft | null>(null);
   // Async dictation and slash-command completions must see the latest edit gate.
   const submissionBlockedRef = useRef(submissionBlocked);
   const valueRef = useRef(value);
@@ -469,6 +479,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   // Bumped whenever the user clears/sends the composer: in-flight FileReader
   // and file.text() reads must not re-append their results afterwards.
   const attachmentRevisionRef = useRef(0);
+  const attachmentIdentityRevisionRef = useRef(0);
   const pendingImageCountRef = useRef(0);
   const pendingTextFileCountRef = useRef(0);
   const pendingTextFileBytesRef = useRef(0);
@@ -546,6 +557,10 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     openContextPanel() {
       setContextOpen(true);
     },
+    retargetPendingRecovery(from, to) {
+      const identity = draftRecoveryIdentityRef.current;
+      if (identity.key === from) identity.key = to;
+    },
   }));
 
   const processImageFiles = useCallback(async (files: File[]) => {
@@ -567,6 +582,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       return;
     }
     const revision = attachmentRevisionRef.current;
+    const identityRevision = attachmentIdentityRevisionRef.current;
     pendingImageCountRef.current += imageFiles.length;
     const created: AttachedImage[] = [];
     try {
@@ -595,7 +611,11 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         return;
       }
       setAttachedImages((prev) => {
-        const accepted = newImages.slice(0, Math.max(0, MAX_ATTACHED_IMAGES - prev.length));
+        // These reads already passed the picker budget before the move.
+        // A merged target must not take away their reserved slots.
+        const accepted = identityRevision !== attachmentIdentityRevisionRef.current
+          ? newImages
+          : newImages.slice(0, Math.max(0, MAX_ATTACHED_IMAGES - prev.length));
         newImages.slice(accepted.length).forEach(revokeImagePreview);
         return [...prev, ...accepted];
       });
@@ -630,6 +650,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       return;
     }
     const revision = attachmentRevisionRef.current;
+    const identityRevision = attachmentIdentityRevisionRef.current;
     pendingTextFileCountRef.current += textFiles.length;
     pendingTextFileBytesRef.current += textFiles.reduce((total, file) => total + file.size, 0);
     try {
@@ -653,7 +674,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       const skipped = textFiles.length - newFiles.length;
       setAttachedTextFiles((prev) => [
         ...prev,
-        ...newFiles.slice(0, Math.max(0, MAX_ATTACHED_TEXT_FILES - prev.length)),
+        ...(identityRevision !== attachmentIdentityRevisionRef.current
+          ? newFiles
+          : newFiles.slice(0, Math.max(0, MAX_ATTACHED_TEXT_FILES - prev.length))),
       ]);
       setAttachError(
         limitMessage
@@ -769,21 +792,70 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   useLayoutEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;
-    setDraft(draftKey, {
+    const draft = {
       value,
       images: attachedImages.map(imageToDraftImage),
       files: attachedTextFiles.map(textFileToDraftFile),
-    });
+    };
+    persistedDraftRef.current = draft;
+    setDraft(draftKey, draft);
   }, [attachedImages, attachedTextFiles, draftKey, value]);
 
   useLayoutEffect(() => {
     const previousDraftKey = draftKeyRef.current;
     if (previousDraftKey === draftKey) return;
 
+    if (draftIdentityMove !== consumedIdentityMoveRef.current
+      && draftIdentityMove?.from === previousDraftKey && draftIdentityMove.to === draftKey) {
+      consumedIdentityMoveRef.current = draftIdentityMove;
+      attachmentIdentityRevisionRef.current += 1;
+      draftRecoveryIdentityRef.current.key = draftKey;
+      // The hook's transfer may precede this batch's mounted state updates.
+      // Add only live deltas to its merged snapshot, not the source twice.
+      const source = draftIdentityMove.sourceDraft ?? persistedDraftRef.current;
+      const draft = getDraft(draftKey);
+      draftKeyRef.current = draftKey;
+      setValue((current) => {
+        const transferred = draft?.value ?? "";
+        if (!source || current === source.value) return transferred;
+        const destination = source.value && transferred.startsWith(source.value)
+          ? transferred.slice(source.value.length).replace(/^\n\n/, "")
+          : transferred;
+        return mergeRecoveredText(destination, { text: current });
+      });
+      setAttachedImages((current) => {
+        // Match occurrences, not a set: intentional identical attachments in
+        // the source or target must retain their original multiplicity.
+        const remaining = [...(source?.images ?? [])];
+        const added = current.filter((image) => {
+          const index = remaining.findIndex((item) => item.data === image.data && item.mimeType === image.mimeType);
+          if (index === -1 && source) return true;
+          if (index !== -1) remaining.splice(index, 1);
+          revokeImagePreview(image);
+          return false;
+        });
+        return [...draftImagesToAttachedImages(draft?.images), ...added];
+      });
+      setAttachedTextFiles((current) => {
+        const remaining = [...(source?.files ?? [])];
+        const added = current.filter((file) => {
+          const index = remaining.findIndex((item) => item.name === file.name && item.mimeType === file.mimeType
+            && item.content === file.content && item.size === file.size);
+          if (index === -1) return Boolean(source);
+          remaining.splice(index, 1);
+          return false;
+        });
+        return [...draftFilesToAttachedFiles(draft?.files), ...added];
+      });
+      setQueuedDeleteTarget(null);
+      return;
+    }
+
     // Invalidate any attachment reads still in flight for the old session so
     // they cannot append onto the new session's composer, and drop any stale
     // validation banner along with the old draft.
     attachmentRevisionRef.current += 1;
+    draftRecoveryIdentityRef.current = { key: draftKey };
     setAttachError(null);
     setQueuedDeleteTarget(null);
 
@@ -806,7 +878,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       return draftImagesToAttachedImages(draft?.images);
     });
     setAttachedTextFiles(draftFilesToAttachedFiles(draft?.files));
-  }, [draftKey]);
+  }, [draftKey, draftIdentityMove]);
 
   useLayoutEffect(() => subscribeDraftRecovery((key, recovery) => {
     if (draftKeyRef.current !== key) return;
@@ -941,6 +1013,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     confirmTranscribe: confirmTranscribeDictation,
   } = useDictation({
     scope: draftKey,
+    identityMove: draftIdentityMove,
     // `after` comes back with the transcript from the server job, so a send or
     // queue chosen before a session switch (which remounts this composer) holds.
     // The run may have started or ended since: queue while the agent runs
@@ -1449,7 +1522,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     if (queueActionPendingRef.current || (action === "steer" && submissionBlockedRef.current)) return;
     queueActionPendingRef.current = true;
     setQueueActionPending(true);
-    const key = draftKeyRef.current;
+    const recoveryIdentity = draftRecoveryIdentityRef.current;
     try {
       if (action === "steer") {
         if (entry.kind === "follow-up") await onPromoteQueuedToSteer?.(entry.text);
@@ -1460,9 +1533,9 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       );
       setQueuedDeleteTarget(null);
       if (!removed || action !== "edit") return;
-      // Recover through the store even if a new composer now owns this key.
+      // Recover to this conversation's last confirmed owner, not a later navigation.
       // omp labels an image-only message "[Image]": not text when it has images.
-      recoverDraft(key, { text: entry.text === "[Image]" && removed.length > 0 ? "" : entry.text, images: removed });
+      recoverDraft(recoveryIdentity.key, { text: entry.text === "[Image]" && removed.length > 0 ? "" : entry.text, images: removed });
     } catch (error) {
       setQueuedDeleteTarget(null);
       toast.error(error instanceof Error ? error.message : String(error));

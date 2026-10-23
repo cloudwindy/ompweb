@@ -7,7 +7,7 @@ import { invalidateModelsCache } from "./models-cache";
 import { RpcCommandError, RpcCommandTimeoutError, RpcProcess, type RpcFrame } from "./omp/rpc-process";
 import { readNativeSettings } from "./omp/settings-config";
 import { getAgentEnvOverrides } from "./omp/agent-env";
-import { editSessionHistory, isSessionEditReply, SESSION_EDIT_COMMAND, SESSION_EDIT_EXTENSION_PATH, type SessionEditResult } from "./omp/session-edit";
+import { editSessionHistory, isSessionEditReply, SESSION_EDIT_COMMAND, SESSION_EDIT_EXTENSION_PATH, SessionEditAgentInvocationError, type SessionEditResult } from "./omp/session-edit";
 import {
   cacheSessionPath,
   invalidateSessionEntriesCache,
@@ -1440,9 +1440,19 @@ export class AgentSessionWrapper {
     const proc = this.proc;
     const sessionId = this._sessionId;
     const sessionFile = this._sessionFile;
+    let persistenceError: Error | null = null;
+    // Keep observing through the authoritative post-edit state query as well
+    // as the helper's reply/ack exchange. The ordinary notice path still emits
+    // the native error to every observer.
+    const unsubscribe = proc.onFrame((frame) => {
+      if (frame.type === "notice" && frame.source === "session-persistence" && frame.level === "error") {
+        persistenceError ??= new Error(typeof frame.message === "string" ? frame.message : "OMP could not persist the history edit");
+      }
+    });
     notifyRunningChange();
     try {
       const before = await this.getStateWithTimeout();
+      if (persistenceError) throw persistenceError;
       if (before.sessionId !== sessionId || before.sessionFile !== sessionFile
         || this._sessionId !== sessionId || this._sessionFile !== sessionFile) {
         throw new WebRpcError("The session changed before the history edit", "session_changed");
@@ -1458,8 +1468,13 @@ export class AgentSessionWrapper {
 
       const result = await editSessionHistory(proc, entryId, sessionId);
       const after = await this.getStateWithTimeout();
-      if (!this.isAlive() || this.proc !== proc || after.sessionId !== sessionId
-        || after.sessionFile !== sessionFile || this._sessionId !== sessionId || this._sessionFile !== sessionFile) {
+      if (persistenceError) throw persistenceError;
+      const unchanged = after.sessionId === sessionId && after.sessionFile === sessionFile;
+      // Only applyIdentity's native move path can retain the originating id.
+      // A reply naming a different conversation is never sufficient evidence.
+      const moved = this.movedFromIds.includes(sessionId) && after.sessionId !== sessionId;
+      if (!this.isAlive() || this.proc !== proc || result.sessionId !== after.sessionId
+        || (!unchanged && !moved) || this._sessionId !== after.sessionId || this._sessionFile !== after.sessionFile) {
         throw new WebRpcError("The session changed during the history edit", "session_changed");
       }
       if (result.cancelled) return result;
@@ -1470,7 +1485,7 @@ export class AgentSessionWrapper {
       this.awaitingAgentStart = false;
       this.awaitingAgentStartDeadline = 0;
       this.continuationGraceUntil = 0;
-      // Identity was checked, so this invalidates only the edited session.
+      // Invalidate the confirmed edited conversation, not its preserved source.
       this.invalidateSessionLists();
       this.emit({ type: "session_history_changed", leafId: result.leafId });
       notifyRunningChange({ refreshSessionList: true });
@@ -1480,10 +1495,17 @@ export class AgentSessionWrapper {
         // A timed-out navigation may still be running in a hook. Do not let a
         // later mutation race it once the web-side fence is released.
         await this.destroyAndWait();
+        if (persistenceError) throw persistenceError;
         throw new WebRpcError("The OMP session stopped responding and was reset.", "session_unresponsive");
       }
-      throw error;
+      if (error instanceof SessionEditAgentInvocationError && !error.agentStarted) {
+        // Native /retry can acknowledge before its deferred agent_start. There
+        // is no observed run to own that gap: stop it before releasing Edit.
+        await this.destroyAndWait();
+      }
+      throw persistenceError ?? error;
     } finally {
+      unsubscribe();
       this.historyEditInFlight = false;
       notifyRunningChange();
     }

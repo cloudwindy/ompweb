@@ -37,7 +37,7 @@ import {
   restoreScrollTop,
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
-import { getDraftSummary } from "@/lib/draft-store";
+import { getDraftSummary, type ChatDraft } from "@/lib/draft-store";
 
 interface Props {
   session: SessionInfo | null;
@@ -53,6 +53,7 @@ interface Props {
   onAgentEnd?: () => void;
   onSessionCreated?: (session: SessionInfo) => void;
   onSessionForked?: (newSessionId: string) => void;
+  onSessionMoved?: (oldId: string, newId: string) => void;
   modelsRefreshKey?: number;
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   sessionInfoContainer?: HTMLDivElement | null;
@@ -470,10 +471,22 @@ const CommittedTranscript = memo(function CommittedTranscript({
   );
 });
 
-export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile, onOpenUrl, onOpenProviders }: Props) {
+export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCallsDefaultCollapsed = true, hideToolActivity = true, expandThinkingByDefault = false, hideThinkingBlock = false, onAgentEnd, onSessionCreated, onSessionForked, onSessionMoved, modelsRefreshKey, chatInputRef, sessionInfoContainer, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsChange, onSessionStatsPanelOpen, onProviderUsageContextChange, onGenerationSpeedChange, onOpenFile, onOpenUrl, onOpenProviders }: Props) {
   const { t, tn } = useI18n();
   const { playDoneSound, unlockAudio } = useAudio();
   const isMobile = useIsMobile();
+  const internalChatInputRef = useRef<ChatInputHandle | null>(null);
+  const composerRef = chatInputRef ?? internalChatInputRef;
+  const [composerIdentityMove, setComposerIdentityMove] = useState<{ from: string; to: string; sourceDraft?: ChatDraft }>();
+  const handleSessionMoved = useCallback((oldId: string, newId: string, sourceDraft?: ChatDraft) => {
+    if (!onSessionMoved) return;
+    // A confirmed Edit changes this conversation's owner, not its composer.
+    // Keep pending reads, capture and transcription alive while rekeying drafts.
+    // Queue HTTP responses can settle before React commits the new draft key.
+    composerRef.current?.retargetPendingRecovery(oldId, newId);
+    setComposerIdentityMove({ from: oldId, to: newId, sourceDraft });
+    onSessionMoved(oldId, newId);
+  }, [composerRef, onSessionMoved]);
 
   // Wrap onAgentEnd to play the completion sound. This is more reliable than
   // wrapping handleAgentEventRef because useAgentSession overwrites that ref
@@ -523,8 +536,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
     handleToolPresetChange,
     btw, askBtw,
   } = useAgentSession({
-    session, newSessionCwd, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked,
-    modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
+    session, newSessionCwd, onAgentEnd: wrappedOnAgentEnd, onSessionCreated, onSessionForked, onSessionMoved: handleSessionMoved,
+    modelsRefreshKey, chatInputRef: composerRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
     onOpenFile, onOpenUrl,
   });
   useEffect(() => {
@@ -831,8 +844,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
 
 
   const onDrop = useCallback((files: File[]) => {
-    chatInputRef?.current?.addFiles(files);
-  }, [chatInputRef]);
+    composerRef.current?.addFiles(files);
+  }, [composerRef]);
 
   const { isDragOver, handleDragEnter, handleDragOver, handleDragLeave, handleDrop } = useDragDrop(onDrop);
 
@@ -1004,8 +1017,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
   const handleExpand = useCallback(() => {
     setComposerMinimized(false);
     /* Focus the textarea after React commits the visibility change */
-    requestAnimationFrame(() => chatInputRef?.current?.focus());
-  }, [chatInputRef]);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }, [composerRef]);
   const composerStatusText = useMemo(() => {
     if (bashRunning && !pendingBash) {
       return t("chatWindow.runningCommand");
@@ -1038,7 +1051,8 @@ export function ChatWindow({ session, newSessionCwd, newSessionWorkspace, toolCa
   }, [askOpen]);
   const chatInputElement = (
     <ChatInput
-      ref={chatInputRef}
+      draftIdentityMove={composerIdentityMove}
+      ref={composerRef}
       sessionInfoContainer={sessionInfoContainer}
       onSend={handleSend}
       onPredictWord={handlePredictWord}
