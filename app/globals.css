@@ -1614,16 +1614,18 @@ html[data-touch-targets="accessible"] :is(.image-lightbox-stepper button, .image
   height: 24px;
 }
 .sidebar-project-actions {
-  /* Match the session status column after reserving timestamp + menu space. */
-  width: 46px;
+  /* Match the session status column after reserving timestamp + menu space;
+     grows when the pin toggle sits beside the menu. */
+  min-width: 46px;
   display: flex;
   justify-content: flex-end;
+  gap: 2px;
 }
 
 /* Touch rows keep the compact timestamp immediately beside a full-size menu target. */
 @media (hover: none), (pointer: coarse) {
   .sidebar-project-actions {
-    width: 56px;
+    min-width: 56px;
   }
   .sidebar-icon-button,
   .sidebar-project-action,
