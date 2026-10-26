@@ -648,13 +648,13 @@ export class AgentSessionWrapper {
     if (this.historyEditInFlight) throw new WebRpcError("Wait for the history edit to finish", "session_busy");
     this.historyMutationPendingCount += 1;
     try {
-      return await this.generateSessionTitle();
+      return await this.generateSessionTitle(quiet);
     } finally {
       this.historyMutationPendingCount -= 1;
     }
   }
 
-  private async generateSessionTitle(): Promise<string | null> {
+  private async generateSessionTitle(quiet = false): Promise<string | null> {
     if (!this.generateTitleUnsupported) {
       try {
         const result = await this.proc.sendCommand<unknown>({ type: "generate_title" }, GENERATE_TITLE_TIMEOUT_MS);
